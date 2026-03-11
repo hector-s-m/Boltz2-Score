@@ -153,6 +153,76 @@ def load_af3_pae_and_chains(
     return filtered_pae, chain_ids, res_types
 
 
+def load_boltz2_pae_and_chains(
+    npz_path: Union[str, Path], pdb_path: Union[str, Path]
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Extracts PAE matrix, chain IDs, and residue types from Boltz2 output files.
+
+    Boltz2 stores PAE in NPZ format (key: "pae") with shape (num_tokens, num_tokens).
+    Chain/residue info is extracted from the original PDB file.
+
+    Args:
+        npz_path: Path to Boltz2 PAE NPZ file (pae_*_model_0.npz)
+        pdb_path: Path to the original input PDB file
+
+    Returns:
+        Tuple of (pae_matrix, chain_ids, residue_types) as numpy arrays
+    """
+    npz_path = Path(npz_path)
+    pdb_path = Path(pdb_path)
+
+    if not npz_path.exists():
+        raise FileNotFoundError(f"NPZ file not found: {npz_path}")
+    if not pdb_path.exists():
+        raise FileNotFoundError(f"PDB file not found: {pdb_path}")
+
+    # Load PAE from NPZ
+    data = np.load(npz_path)
+    raw_pae = data["pae"]
+
+    # Parse PDB for chain/residue info (same logic as AF3 loader)
+    chains = []
+    residue_types = []
+
+    with open(pdb_path, "r") as f:
+        for line in f:
+            if not (line.startswith("ATOM") or line.startswith("HETATM")):
+                continue
+
+            atom = parse_pdb_atom_line(line)
+            if atom is None:
+                continue
+
+            atom_name = atom["atom_name"]
+            res_name = atom["residue_name"]
+
+            if atom_name == "CA" or (
+                res_name in NUCLEIC_ACIDS and "C1" in atom_name
+            ):
+                chains.append(atom["chain_id"])
+                residue_types.append(res_name)
+
+    chain_ids = np.array(chains)
+    res_types = np.array(residue_types)
+
+    # Validate dimensions
+    n_tokens = len(chains)
+    n_pae = raw_pae.shape[0]
+
+    if n_tokens != n_pae:
+        print(
+            f"[Warning] Token count from PDB ({n_tokens}) does not match "
+            f"Boltz2 PAE dimensions ({n_pae}). Cropping to min."
+        )
+        min_dim = min(n_tokens, n_pae)
+        raw_pae = raw_pae[:min_dim, :min_dim]
+        chain_ids = chain_ids[:min_dim]
+        res_types = res_types[:min_dim]
+
+    return raw_pae, chain_ids, res_types
+
+
 def _calc_d0_array(
     L_array: np.ndarray, pair_type: str = "protein"
 ) -> np.ndarray:
@@ -267,35 +337,34 @@ def calculate_ipsae(
 
 
 if __name__ == "__main__":
-    # Example paths
-    pdb_file = Path(
-        "/Users/wanghongzhun/Documents/Code/AF3score/ipsae_test/7a0w_ef_b.pdb"
-    )
-    json_file = Path(
-        "/Users/wanghongzhun/Documents/Code/AF3score/ipsae_test/7a0w_ef_b/seed-10_sample-0/confidences.json"
-    )
+    import argparse
 
-    if pdb_file.exists() and json_file.exists():
-        try:
-            print(f"Processing: {pdb_file} ...")
-            pae, chains, res_types = load_af3_pae_and_chains(
-                json_file, pdb_file
-            )
+    parser = argparse.ArgumentParser(description="Calculate ipSAE scores")
+    parser.add_argument("--pdb", type=str, required=True, help="Path to PDB file")
+    parser.add_argument("--pae", type=str, required=True,
+                        help="Path to PAE file (JSON for AF3, NPZ for Boltz2)")
+    parser.add_argument("--format", choices=["af3", "boltz2"], default="boltz2",
+                        help="PAE file format (default: boltz2)")
+    parser.add_argument("--cutoff", type=float, default=10.0, help="PAE cutoff")
+    args = parser.parse_args()
 
-            # Debugging output
-            print(f"PAE shape: {pae.shape}, Chains shape: {chains.shape}")
+    pdb_file = Path(args.pdb)
+    pae_file = Path(args.pae)
 
-            results = calculate_ipsae(
-                pae, chains, res_types, pae_cutoff=10
-            )
-
-            print("\nipSAE Scores (Directional Chain A -> Chain B):")
-            for pair_id, score in results.items():
-                # Display results in "Chain1 -> Chain2: Score" format
-                c1, c2 = pair_id.split("_")
-                print(f"  {c1} -> {c2}: {score:.4f}")
-
-        except Exception as e:
-            print(f"Error during processing: {e}")
+    if not pdb_file.exists():
+        print(f"PDB file not found: {pdb_file}")
+    elif not pae_file.exists():
+        print(f"PAE file not found: {pae_file}")
     else:
-        print("Example files not found. Please check your file paths.")
+        if args.format == "af3":
+            pae, chains, res_types = load_af3_pae_and_chains(pae_file, pdb_file)
+        else:
+            pae, chains, res_types = load_boltz2_pae_and_chains(pae_file, pdb_file)
+
+        print(f"PAE shape: {pae.shape}, Chains: {len(chains)}")
+        results = calculate_ipsae(pae, chains, res_types, pae_cutoff=args.cutoff)
+
+        print("\nipSAE Scores:")
+        for pair_id, score in results.items():
+            c1, c2 = pair_id.split("_")
+            print(f"  {c1} -> {c2}: {score:.4f}")

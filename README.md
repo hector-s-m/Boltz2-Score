@@ -1,107 +1,104 @@
-# AF3Score Pipeline
+# Boltz2-Score
 
-A pipeline for evaluating protein structure quality using AF3Score.
+Protein complex scoring pipeline using [Boltz2](https://github.com/jwohlwend/boltz) (MIT license). Drop-in replacement for AF3Score, using Boltz2's PyTorch engine instead of AlphaFold3.
 
-## Environment Setup
+## Installation
 
-### 1. Create and Activate Conda Environment
 ```bash
-conda create -n af3score python=3.11
-conda activate af3score
-conda install gxx_linux-64 gxx_impl_linux-64 gcc_linux-64 gcc_impl_linux-64=13.2.0
+conda create -n boltz2score python=3.11
+conda activate boltz2score
+pip install -r requirements.txt
 ```
 
+Requirements: `boltz[cuda]>=0.5.0`, `biopython`, `numpy`, `pandas`, `pyyaml`, `tqdm`.
 
-### 2. Install AF3Score and Dependencies
+## Quick Start
+
 ```bash
-git clone https://github.com/Mingchenchen/AF3Score.git
-cd AF3Score/
-
-# Install Python dependencies
-pip install -r dev-requirements.txt
-pip install --no-deps -e .
-build_data
-
-# Install additional dependencies
-conda install -c conda-forge biopython h5py pandas
+# Full pipeline: PDB files → Boltz2 prediction → metrics CSV
+python boltz2_score.py --input_dir input_pdbs/ --output_dir results/
 ```
 
+Output: `results/boltz2_metrics.csv`
 
-### 3. (Optional) MSA Generation Setup
-Download Databases:
+## Pipeline Steps
+
+The pipeline has three stages, each runnable independently:
+
+### 1. Prepare Boltz2 inputs (PDB → YAML)
+
 ```bash
-bash fetch_databases.sh <DB_DIR>  # Replace <DB_DIR> with your database directory
+python prepare_boltz_input.py --input_dir input_pdbs/ --output_dir boltz_yaml/
 ```
 
-Install HMMER:
+Extracts chain sequences from PDB files and generates Boltz2-compatible YAML files. Validates PDB integrity and chain sequences before conversion.
+
+### 2. Run Boltz2 inference
+
 ```bash
-mkdir ~/hmmer_build ~/hmmer
-wget http://eddylab.org/software/hmmer/hmmer-3.4.tar.gz -P ~/hmmer_build
-cd ~/hmmer_build
-tar -zxf hmmer-3.4.tar.gz
-cd hmmer-3.4
-./configure --prefix=~/hmmer
-make -j8
-make install
+python run_boltz2score.py --input boltz_yaml/ --output_dir boltz_predictions/
 ```
 
-Add HMMER to your PATH:
+Runs `boltz predict` via subprocess. Generates structure predictions with confidence metrics (PAE, pLDDT, PDE as NPZ files + confidence JSON).
+
+### 3. Extract metrics
+
 ```bash
-export PATH="~/hmmer/bin:$PATH"
+python extract_boltz2_metrics.py --input_pdb_dir input_pdbs/ --boltz_output_dir boltz_predictions/
 ```
 
-Verify installation:
+Parses Boltz2 outputs into a CSV with per-chain and inter-chain metrics.
+
+## Unified CLI Options
+
 ```bash
-hmmsearch -h
+python boltz2_score.py --input_dir input_pdbs/ --output_dir results/ \
+    --use_templates \          # Use input PDBs as structural templates
+    --use_potentials \         # Enable physical potentials
+    --no_msa_server \          # Disable MSA server (use pre-computed MSAs)
+    --diffusion_samples 5 \    # Number of structure samples per input
+    --recycling_steps 3 \      # Recycling iterations
+    --sampling_steps 200 \     # Diffusion sampling steps
+    --devices 1 \              # Number of GPU devices
+    --accelerator gpu \        # gpu, cpu, or tpu
+    --num_workers 4            # Parallel workers for data processing
 ```
 
-## Usage Pipeline
+Skip individual stages with `--skip_prepare`, `--skip_inference`, or `--skip_metrics`.
 
-The **AF3Score pipeline** is designed for high-throughput evaluation of protein structures. It consists of two primary scripts tailored for single-batch or multi-batch processing on high-performance computing (HPC) clusters.
+### Batch mode
 
-### 1. Main Pipeline Script
-
-`AF3score_pipeline.sh` is the core utility used to process a single directory of PDB files.
-
-**Usage:**
-
-Before running the pipeline on a shell cluster, you must configure the variables within `AF3score_pipeline.sh`.
-
-| Variable | Description | Example Value |
-| --- | --- | --- |
-| `PYTHON_EXEC` | Path to the specific Conda environment Python binary. | `~/anaconda3/envs/af3score/bin/python` |
-| `slurm_partition` | Target GPU partitions for job submission. | `gpu1,gpu2` |
-| `slurm_nodelist` | Specific nodes assigned for the computation. | `c06b14n[05-06],c06b19n[05-06]` |
-
-Run the pipeline:
 ```bash
-./AF3score_pipeline.sh <input_pdb_dir> <output_dir> <num_jobs>
+# Step 1: Prepare with batch partitioning
+python prepare_boltz_input.py --input_dir pdbs/ --output_dir yaml/ \
+    --batch_dir batches/ --num_jobs 4
 
+# Step 2: Run with batch directory
+python boltz2_score.py --input_dir pdbs/ --output_dir results/ \
+    --skip_prepare --batch_dir batches/
 ```
-
-* **`<input_pdb_dir>`**: Path to the directory containing your input `.pdb` files.
-* **`<output_dir>`**: Target directory where AF3Score metrics and results will be saved.
-* **`<num_jobs>`**: The number of parallel jobs to launch.
-
-### 2. Batch Processing
-
-For users handling multiple datasets across several directories, use the multi-directory wrapper `AF3score_mutildir.sh`.
-
 
 ## Output Metrics
 
-The pipeline generates the following scoring metrics:
-
 | Metric | Level | Description |
-| --- | --- | --- |
-| **pTM** | Global / Per-chain | **Predicted TM-score:** Measures the overall topological accuracy of the global structure. |
-| **ipTM** | Global / Inter-chain | **Interface pTM:** Assesses the accuracy of the interfaces between different protein chains. |
-| **pLDDT** | Per-residue / Per-chain | **Predicted Local Distance Difference Test:** A per-residue confidence score (0-100). Higher values indicate higher local structure stability. |
-| **PAE** | Per-chain | **Predicted Aligned Error:** The expected distance error (in Å) between pairs of residues. Lower values indicate higher confidence in relative positioning. |
-| **ipSAE** | Inter-chain | **interaction prediction Score from Aligned Errors:** Specifically focuses on the binding interface of two chains. |
+|--------|-------|-------------|
+| **pTM** | Global / Per-chain | Predicted TM-score. Overall topological accuracy. |
+| **ipTM** | Global / Inter-chain | Interface pTM. Accuracy of chain-chain interfaces. |
+| **pLDDT** | Per-chain | Predicted Local Distance Difference Test (0-100). Per-residue confidence. |
+| **PAE** | Per-chain / Inter-chain | Predicted Aligned Error (Angstroms). Lower = higher confidence. |
+| **PDE** | Per-chain / Inter-chain | Predicted Distance Error. Boltz2-specific distance confidence. |
+| **ipSAE** | Inter-chain | Interaction prediction Score from Aligned Errors. Interface binding quality. |
+| **confidence_score** | Global | Boltz2 composite confidence score. |
 
-Global level metrics are evaluates the quality of the overall structure. Per-chain metrics are focused on the quality of individual chains. Inter-chain metrics are designed to assess the quality of the docking between two chains.
+## ipSAE Calculator (standalone)
+
+```bash
+python ipsae_calculator.py --pdb structure.pdb --pae pae_model_0.npz --format boltz2
+```
+
+Supports both Boltz2 NPZ and AF3 JSON PAE formats.
 
 ## Reference
 
-For more information about AlphaFold3, please visit their [GitHub Repository](https://github.com/google-deepmind/alphafold3)
+- Boltz2: [github.com/jwohlwend/boltz](https://github.com/jwohlwend/boltz)
+- AF3Score (original): [github.com/Mingchenchen/AF3Score](https://github.com/Mingchenchen/AF3Score)
